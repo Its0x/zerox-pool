@@ -1830,6 +1830,14 @@ static void parse_config(pool_t *ckp)
         if (ckp->pool_fee < 0.0) ckp->pool_fee = 0.0;
         else if (ckp->pool_fee > 100.0) ckp->pool_fee = 100.0;
     }
+    // finder_percent
+    if (! json_get_double(&ckp->finder_percent, json_conf, "finder_percent") ) {
+        ckp->finder_percent = 0.0; // default: disabled
+    } else {
+        // verify sanity
+        if (ckp->finder_percent < 0.0) ckp->finder_percent = 0.0;
+        else if (ckp->finder_percent > 100.0) ckp->finder_percent = 100.0;
+    }
     json_get_int(&ckp->blockpoll, json_conf, "blockpoll");
     json_get_int(&ckp->nonce1length, json_conf, "nonce1length");
     json_get_int(&ckp->nonce2length, json_conf, "nonce2length");
@@ -1854,7 +1862,25 @@ static void parse_config(pool_t *ckp)
     parse_trusted(ckp, arr_val);
     json_get_string(&ckp->upstream, json_conf, "upstream");
     json_get_int64(&ckp->mindiff, json_conf, "mindiff");
-    json_get_int64(&ckp->startdiff, json_conf, "startdiff");
+    {
+        /* "startdiff" is either a single integer applied to every port, or an
+         * array of integers parallel to the "serverurl" array for per-port
+         * start difficulties (e.g. a low port for Bitaxes, a high one for
+         * farms). Entries <= 0 fall back to the global startdiff. */
+        json_t *sd = json_object_get(json_conf, "startdiff");
+        if (sd && json_is_array(sd) && ckp->serverurls > 0) {
+            const int n = json_array_size(sd);
+            ckp->startdiffs = ckzalloc(sizeof(int64_t) * ckp->serverurls);
+            for (int i = 0; i < ckp->serverurls; i++) {
+                json_t *v = json_array_get(sd, i < n ? i : (n ? n - 1 : 0));
+                ckp->startdiffs[i] = v && json_is_integer(v) ? json_integer_value(v) : 0;
+            }
+            /* Global fallback (proxies, sanity default) = first entry */
+            if (n && json_is_integer(json_array_get(sd, 0)))
+                ckp->startdiff = json_integer_value(json_array_get(sd, 0));
+        } else
+            json_get_int64(&ckp->startdiff, json_conf, "startdiff");
+    }
     json_get_int64(&ckp->maxdiff, json_conf, "maxdiff");
     {
         // parse mindiff_overrides -- this must be called after mindiff and maxdiff above are already set up
@@ -2240,6 +2266,17 @@ int main(int argc, char **argv)
     // refuse to proceed if single_payout_override is specified and solo mode is also specified
     if (ckp.single_payout_override && ckp.solo)
         quit(1, "Cannot use single_payout_override mode with SOLO mode (-B)");
+
+    // finder_percent pays a per-client personalized coinbase bonus; it is meaningless in SOLO mode
+    // (winner already takes all) and conflicts with collapsing payouts to a single address
+    if (ckp.finder_percent > 0.0 && ckp.solo)
+        quit(1, "Cannot use finder_percent with SOLO mode (-B)");
+    if (ckp.finder_percent > 0.0 && ckp.single_payout_override)
+        quit(1, "Cannot use finder_percent with single_payout_override");
+    // it also requires control over the coinbase of every job, which proxy/passthrough/node/remote
+    // modes do not have
+    if (ckp.finder_percent > 0.0 && (ckp.proxy || ckp.passthrough || ckp.node || ckp.remote))
+        quit(1, "Cannot use finder_percent in proxy, passthrough, node or remote mode");
 
     // set up donation addresses
     {

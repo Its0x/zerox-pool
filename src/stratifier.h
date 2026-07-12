@@ -93,6 +93,18 @@ struct genwork {
         uchar coinb3bin[4]; // coinbase txn footer (always just 4 blank locktime bytes)
         uint8_t coinb3len; // length of above
     } solo;
+    /* finder_percent (parasite payout) mode only. Set by plan_para_payouts() in
+       stratifier.c; every payout output lives in the per-user coinb2 so each
+       miner's job can pay themselves the flat finder bonus and exclude
+       themselves from the proportional remainder split. */
+    struct {
+        void *slots; // array of struct para_slot (internal to stratifier.c), freed with the workbase
+        int n_slots;
+        double total_herp; // sum of herp over all slots
+        uint64_t reward; // remainder split proportionally among non-finders (sats)
+        uint64_t finder; // flat finder bonus (sats)
+        int max_user_cb2; // upper bound on per-user coinb2 length, for buffer sizing
+    } para;
 
     /* Cached header binary */
     char headerbin[112];

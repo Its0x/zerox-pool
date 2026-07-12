@@ -1,3 +1,32 @@
+Zero X Pool fork (0x.al)
+========================
+
+This is the source code powering https://0x.al — a SOLO-hybrid ("parasite
+style") Bitcoin Cash mining pool. It is a fork of asicseer-pool (GPLv3, see
+below and COPYING) adding a trustless finder-bonus payout model:
+
+* New config option "finder_percent" (0.0 disables everything below and
+  preserves stock SPLNS behavior). When active:
+  - The miner that finds a block receives a flat percentage of the full block
+    reward (subsidy + fees), paid directly in the coinbase.
+  - The remainder is split among all OTHER miners proportionally to shares
+    submitted since the pool's previous block (the finder is excluded from
+    the split, parasite.wtf-style). No rolling window: share counters reset
+    each time the pool finds a block. Sub-dust payouts carry forward.
+  - Implemented by extending SOLO mode's per-user workbase machinery: every
+    connected miner receives a personalized coinbase paying the finder bonus
+    to themselves, so payouts need no pool wallet and no trust whatsoever.
+* "startdiff" may be an array parallel to "serverurl" for per-port start
+  difficulties (e.g. a low-diff port for Bitaxes, a high one for farms).
+* Misc: fixed a SIGFPE on regtest (network_diff truncates to 0 in uint64).
+
+Every payout is verifiable on-chain in each block's coinbase. Audit the model
+in src/stratifier.c (search for PARA_MODE / plan_para_payouts).
+
+Upstream project follows below, unchanged.
+
+========================
+
 ASICseer Pool
 Calin Culianu <calin.culianu@gmail.com>
 

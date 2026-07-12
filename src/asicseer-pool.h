@@ -265,6 +265,11 @@ struct pool_instance {
     /* Difficulty settings */
     int64_t mindiff; // Default 1
     int64_t startdiff; // Default 42
+    /* Per-port start difficulties, parallel to serverurl[] (config "startdiff"
+       as an array). NULL means use the global startdiff for every port. Lets
+       low-hash devices (Bitaxe) and farms start near their real difficulty
+       instead of waiting for vardiff to converge. */
+    int64_t *startdiffs;
     int64_t maxdiff; // No default
 
     const mindiff_override_t *mindiff_overrides; // Taken from top-level "mindiff_overrides" : { ... } in config.
@@ -295,6 +300,12 @@ struct pool_instance {
     } dev_donations[DONATION_NUM_ADDRESSES];  // [0] = calin, [1] = bchn -- see donation.h
 
     double pool_fee; // comes from "pool_fee" in config, as a percentage. Defaults to 1.0 if unspecified. SPLNS mode only.
+
+    /* Percentage of the total block reward paid as a flat bonus to the miner that finds the block,
+       via a personalized per-client coinbase output (parasite.wtf-style payout). 0.0 disables the
+       feature and preserves stock SPLNS behavior. The finder is excluded from the proportional
+       remainder split. Comes from "finder_percent" in config. SPLNS mode only. */
+    double finder_percent;
 
     bool disable_dev_donation; // comes from "disable_dev_donation" top level key. Defaults to false if unspecified.
 
