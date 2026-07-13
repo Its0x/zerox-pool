@@ -6881,6 +6881,23 @@ static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t cli
     stratum_add_send(sdata, json_msg, client_id, SM_UPDATE);
 }
 
+/* Strip a cashaddr network prefix from a stratum username so that
+ * "bitcoincash:qq..." and "qq..." map to the same pool account (the prefix
+ * carries no information - the node validates both spellings identically). */
+static const char *strip_cashaddr_prefix(const char *buf)
+{
+    static const char *prefixes[] = {"bitcoincash:", "bchtest:", "bchreg:"};
+
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(*prefixes); i++) {
+        const size_t plen = strlen(prefixes[i]);
+
+        if (!strncasecmp(buf, prefixes[i], plen) &&
+            buf[plen] && buf[plen] != '.' && buf[plen] != '_')
+            return buf + plen;
+    }
+    return buf;
+}
+
 /* Needs to be entered with client holding a ref count. */
 static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_val, json_t **err_val)
 {
@@ -6927,6 +6944,8 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
         *err_val = json_string("Invalid character in username");
         goto out;
     }
+    /* Normalize away a cashaddr prefix so both spellings are one account */
+    buf = strip_cashaddr_prefix(buf);
     pass = json_string_value(json_array_get(params_val, 1));
     user = generate_user(ckp, client, buf);
     client->user_id = user->id;
