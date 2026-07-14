@@ -1149,11 +1149,21 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
         strbuffer_append_bytes(strbuf, buf, len);
     }
 
+    /* The extranonce bytes appended by the miner form the TAIL of the
+     * scriptsig (BTC-ckpool style) rather than living inside an OP_RETURN
+     * output. This keeps every tx output contiguous within coinb2, so
+     * coinbase parsers in miner firmware (AxeOS/HexOS block preview, reward
+     * share banner) decode the outputs correctly without knowing the
+     * extranonce bytes. Reserve their space in the scriptsig budget now. */
+    wb->enonce1varlen = ckp->nonce1length;
+    wb->enonce2varlen = ckp->nonce2length;
+    const int enonce_len = wb->enonce1varlen + wb->enonce2varlen;
+
     len = strbuf->length - 41 - 1; // account for the header and scriptsig length byte.
     {
-        // ensure that what follows is <=100 bytes total for the scriptsig otherwise
-        // block will be rejected as per BCH consensus rules.
-        const int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len;
+        // ensure the whole scriptsig (height + text + extranonces) stays <=100
+        // bytes, otherwise the block is rejected per BCH consensus rules.
+        const int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len - enonce_len;
         if (ckp->n_bchsigs > 0) {
             // pick a random coinbase text from the array of sigs defined in conf "bchsig"
             // (this may be just 1 item or empty)
@@ -1168,7 +1178,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
         }
     }
 
-    len = strbuf->length - 41 - 1; // again, account for the header and scriptsig length byte.
+    len = strbuf->length - 41 - 1 + enonce_len; // final scriptsig length, including the extranonce tail
     /* Set the scriptsig length now - always 1 byte of data (length is always <=100) */
     strbuf->uvalue[41] = (uint8_t)len;
 
@@ -1179,117 +1189,121 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
              "%d bytes.  File: %s, line: %d", (int)MAX_COINBASE_SCRIPTSIG_LEN, (int)(wb->coinb1bin[41]),
              __FILE__, (int)__LINE__);
     }
-    // after scriptsig, put sequence
-    strbuffer_append_bytes(strbuf, "\xff\xff\xff\xff", 4);
-
-    // at this point strbuf (and cb1_buf) points to the tx.vout length field (compact size).
-    // reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
-    const int compact_size_pos = strbuf->length;
-#define compact_size_reserved 3
+    /* Coinb1 is done: it deliberately ends mid-scriptsig. The miner-appended
+     * extranonce1 + extranonce2 complete the scriptsig, and everything after
+     * (sequence, outputs, locktime) lives in coinb2. */
     {
-        uint8_t resv[compact_size_reserved];
-        memset(resv, 0, compact_size_reserved);
-        strbuffer_append_bytes(strbuf, resv, compact_size_reserved);
-    }
-    int first_tx_pos = strbuf->length;
-
-    /* Add all the payout outputs (including pool fees and donations, if any, etc).
-       In the rare case of leftover satoshis, they are guaranteed to go back to the pool
-       as a fallback.  The below call always succeeds if it returns. */
-    const uint64_t solo_amount = add_coinbase_payouts(ckp, wb, &cb1_buf);
-
-    if (ckp->solo) {
-        // SOLO mode, leave room for 1 output for the solo miner. This output goes at the end of cb2
-        ++cb1_buf.num_outs;
-    } else if (PARA_MODE(ckp)) {
-        // Parasite mode: every per-user coinb2 carries exactly n_slots + 1 payout outputs
-        cb1_buf.num_outs += wb->para.n_slots + 1;
-    }
-
-    /* OP_RETURN output at end, after all payouts (note: in SOLO mode the solo miner payout is after this) */
-    {
-        // append OP_RETURN output (this leaves space for enonce1 and enonce2)
-        wb->enonce1varlen = ckp->nonce1length;
-        wb->enonce2varlen = ckp->nonce2length;
-        static const uint8_t amt0[8] = {0,0,0,0,0,0,0,0};
-        // script is: OP_RETURN length_byte(20) enonce1_bytes[4] enonce2_bytes[8] random_bytes[8]
-        int scriptlen = 1 + 1 + wb->enonce1varlen + wb->enonce2varlen + sizeof(random_bytes);
-        strbuffer_append_bytes(strbuf, amt0, 8); // amount
-        assert(scriptlen < 223 && scriptlen > 2); // script should be > 2 bytes and less than max OP_RETURN size
-        strbuffer_append_byte(strbuf, (uint8_t)scriptlen); // push script length
-        strbuffer_append_byte(strbuf, 0x6a); // push OP_RETURN
-        strbuffer_append_byte(strbuf, (uint8_t)(scriptlen - 2)); // push OP_RETURN payload length
-        ++cb1_buf.num_outs; // increment output counter for this OP_RETURN output
-    }
-    /* Cb1 is done. Take the pointer, assign it to coinb1bin, write compact size before the outs. */
-    {
-        // note that we may have to move the data blob back by 2 bytes here if <253 outs.
-        const size_t num_outs = cb1_buf.num_outs;
         size_t endpos, cap;
         cb1_buffer_take(&cb1_buf, &wb->coinb1bin, &endpos, &cap);
         LOGDEBUG("Coinb1 taken, endpos: %lu cap: %lu", endpos, cap);
         wb->coinb1len = (int)endpos;
         assert(((size_t)wb->coinb1len) == endpos && wb->coinb1len > -1 && "INTERNAL ERROR: integer overflow");
+    }
+    wb->coinb1 = bin2hex(wb->coinb1bin, wb->coinb1len);
+    LOGDEBUG("Coinb1: %s", wb->coinb1);
+    /* Coinbase 1 complete */
+
+    /* Coinb2 carries the entire post-scriptsig transaction: sequence, output
+     * count, all outputs, and the locktime (except in SOLO/parasite modes,
+     * where the per-user coinb2 tails supply the final output(s)+locktime). */
+    cb1_buffer_t cb2_buf;
+    strbuffer_t * const strbuf2 = &cb2_buf.buffer;
+    cb1_buffer_init(&cb2_buf, COINB1_INITIAL_CAPACITY);
+
+    // sequence
+    strbuffer_append_bytes(strbuf2, "\xff\xff\xff\xff", 4);
+
+    // reserve 3 bytes for the tx.vout count (compact size); common case is we
+    // move the data back by 2 bytes at the end.
+    const int compact_size_pos = strbuf2->length;
+#define compact_size_reserved 3
+    {
+        uint8_t resv[compact_size_reserved];
+        memset(resv, 0, compact_size_reserved);
+        strbuffer_append_bytes(strbuf2, resv, compact_size_reserved);
+    }
+    int first_tx_pos = strbuf2->length;
+
+    /* Add all the payout outputs (including pool fees and donations, if any, etc).
+       In the rare case of leftover satoshis, they are guaranteed to go back to the pool
+       as a fallback.  The below call always succeeds if it returns. */
+    const uint64_t solo_amount = add_coinbase_payouts(ckp, wb, &cb2_buf);
+
+    if (ckp->solo) {
+        // SOLO mode, leave room for 1 output for the solo miner. This output goes at the end of cb2
+        ++cb2_buf.num_outs;
+    } else if (PARA_MODE(ckp)) {
+        // Parasite mode: every per-user coinb2 tail carries exactly n_slots + 1 payout outputs
+        cb2_buf.num_outs += wb->para.n_slots + 1;
+    }
+
+    /* OP_RETURN output holding the 8 random bytes that keep each workbase's
+     * coinbase unique across template regenerations */
+    {
+        static const uint8_t amt0[8] = {0,0,0,0,0,0,0,0};
+        const int scriptlen = 1 + 1 + (int)sizeof(random_bytes); // OP_RETURN, pushlen, payload
+        strbuffer_append_bytes(strbuf2, amt0, 8); // amount
+        strbuffer_append_byte(strbuf2, (uint8_t)scriptlen); // script length
+        strbuffer_append_byte(strbuf2, 0x6a); // OP_RETURN
+        strbuffer_append_byte(strbuf2, (uint8_t)sizeof(random_bytes)); // payload push length
+        strbuffer_append_bytes(strbuf2, random_bytes, sizeof(random_bytes));
+        ++cb2_buf.num_outs;
+    }
+
+    /* Mode-specific coinb2 tail, appended before the compact-size fixup */
+    if (!ckp->solo && !PARA_MODE(ckp)) {
+        // the shared coinb2 is the whole rest of the tx: append nlocktime
+        static const uint8_t locktime0[4] = {0,0,0,0};
+        strbuffer_append_bytes(strbuf2, locktime0, 4);
+        wb->solo.coinb3len = 0; // paranoia, should already be 0
+    } else if (PARA_MODE(ckp)) {
+        // per-user outputs + nlocktime are appended in find_or_generate_userwb__
+        memset(wb->solo.coinb3bin, 0, 4);
+        wb->solo.coinb3len = 4;
+    } else {
+        // SOLO: write the solo miner payout amount, which must end coinb2;
+        // the per-user script + nlocktime (coinb3) follow in the userwb
+        const uint64_t amt = htole64(solo_amount);
+        strbuffer_append_bytes(strbuf2, (const char *)&amt, sizeof(amt));
+        memset(wb->solo.coinb3bin, 0, 4);
+        wb->solo.coinb3len = 4;
+    }
+
+    /* Take cb2 and write the compact size before the outputs. */
+    {
+        const size_t num_outs = cb2_buf.num_outs;
+        size_t endpos, cap;
+        cb1_buffer_take(&cb2_buf, &wb->coinb2bin, &endpos, &cap);
+        LOGDEBUG("Coinb2 taken, endpos: %lu cap: %lu", endpos, cap);
+        wb->coinb2len = (int)endpos;
+        assert(((size_t)wb->coinb2len) == endpos && wb->coinb2len > -1 && "INTERNAL ERROR: integer overflow");
         uint8_t compact_size_buf[9];
         const int nb = write_compact_size(compact_size_buf, num_outs);
         if (unlikely(nb > compact_size_reserved)) {
             quit(1, "INTERNAL ERROR: Got %lu outs in coinbase! This is unsupported!", num_outs);
         } else if (nb == compact_size_reserved) {
             // >= 253 outs. this is what we assumed as worst-case and we don't need to realign the data.
-            memcpy(wb->coinb1bin + compact_size_pos, compact_size_buf, nb);
+            memcpy(wb->coinb2bin + compact_size_pos, compact_size_buf, nb);
         } else if (nb == 1) {
             // < 253 outs, we need to slide the tx data blob backwards by 2 bytes.
-            const int blob_size = wb->coinb1len - first_tx_pos;
+            const int blob_size = wb->coinb2len - first_tx_pos;
             const int ndiff = compact_size_reserved - nb;
             assert(blob_size >= 0);
             assert(ndiff == first_tx_pos - (compact_size_pos + 1));
             if (blob_size) {
-                memmove(wb->coinb1bin + compact_size_pos + 1, wb->coinb1bin + first_tx_pos, blob_size);
+                memmove(wb->coinb2bin + compact_size_pos + 1, wb->coinb2bin + first_tx_pos, blob_size);
                 endpos -= ndiff;
-                wb->coinb1len -= ndiff;
-                LOGDEBUG("Coinb1 moved %d-byte blob backwards by %d bytes, endpos now: %d",
-                         blob_size, ndiff, wb->coinb1len);
+                wb->coinb2len -= ndiff;
+                LOGDEBUG("Coinb2 moved %d-byte blob backwards by %d bytes, endpos now: %d",
+                         blob_size, ndiff, wb->coinb2len);
             }
             first_tx_pos -= ndiff;
-            wb->coinb1bin[compact_size_pos] = *compact_size_buf; // write size byte
+            wb->coinb2bin[compact_size_pos] = *compact_size_buf; // write size byte
         } else {
             // this should never happen.
             quit(1, "Unexpected compact_size number of bytes!");
         }
         LOGDEBUG("num_outs: %lu", num_outs);
-    }
-    wb->coinb1 = bin2hex(wb->coinb1bin, wb->coinb1len);
-    LOGDEBUG("Coinb1: %s", wb->coinb1);
-    /* Coinbase 1 complete */
-
-    if (!ckp->solo && !PARA_MODE(ckp)) {
-        wb->coinb2len = sizeof(random_bytes) + 4; // timestamp (end of OP_RETURN) + nlocktime == 4 bytes of zeroes at end
-        wb->coinb2bin = ckzalloc(wb->coinb2len);
-        memcpy(wb->coinb2bin, random_bytes, sizeof(random_bytes)); // copy random bytes to end of OP_RETURN
-        wb->solo.coinb3len = 0; // paranoia, should already be 0
-    } else if (PARA_MODE(ckp)) {
-        // Parasite mode: like SOLO but the shared coinb2 carries no amount --
-        // every payout output (amounts and scripts) lives in the per-user coinb2
-        wb->coinb2len = sizeof(random_bytes); // timestamp (end of OP_RETURN) only
-        wb->coinb2bin = ckzalloc(wb->coinb2len);
-        memcpy(wb->coinb2bin, random_bytes, sizeof(random_bytes));
-        memset(wb->solo.coinb3bin, 0, 4);
-        wb->solo.coinb3len = 4; // nlocktime bytes, appended after the per-user outputs
-    } else {
-        // Handle SOLO mode here:
-        // - where we *don't* write nlocktime to coinb2; instead we rely on coinb3 for the 4 empty nlocktime bytes
-        // - we do write the random_bytes end of OP_RETURN
-        // - we do write the amount here for the solo miner payout which must end at end of coinb2
-        wb->coinb2len = sizeof(random_bytes) + 8; // timestamp (end of OP_RETURN) + amount for the miner-specific payout
-        wb->coinb2bin = ckzalloc(wb->coinb2len);
-        size_t offset = 0;
-        memcpy(wb->coinb2bin + offset, random_bytes, sizeof(random_bytes));
-        offset += sizeof(random_bytes);
-        const uint64_t amt = htole64(solo_amount);
-        memcpy(wb->coinb2bin + offset, &amt, sizeof(amt));
-        offset += sizeof(amt);
-        memset(wb->solo.coinb3bin, 0, 4);
-        wb->solo.coinb3len = 4; // nlocktime bytes
     }
     wb->coinb2 = bin2hex(wb->coinb2bin, wb->coinb2len);
     LOGDEBUG("Coinb2: %s", wb->coinb2);
@@ -4665,6 +4679,25 @@ static void reset_shareaccounting(sdata_t *sdata)
     ck_wunlock(&sdata->instance_lock);
 }
 
+/* Strip a cashaddr network prefix from a stratum username so that
+ * "bitcoincash:qq..." and "qq..." map to the same pool account (the prefix
+ * carries no information - the node validates both spellings identically).
+ * Applied only to the derived account key, never to the workername the miner
+ * echoes back in share submissions. */
+static const char *strip_cashaddr_prefix(const char *buf)
+{
+    static const char *prefixes[] = {"bitcoincash:", "bchtest:", "bchreg:"};
+
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(*prefixes); i++) {
+        const size_t plen = strlen(prefixes[i]);
+
+        if (!strncasecmp(buf, prefixes[i], plen) &&
+            buf[plen] && buf[plen] != '.' && buf[plen] != '_')
+            return buf + plen;
+    }
+    return buf;
+}
+
 static user_instance_t *user_by_workername(sdata_t *sdata, const char *workername)
 {
     char *username = strdupa(workername), *ignore;
@@ -4673,8 +4706,9 @@ static user_instance_t *user_by_workername(sdata_t *sdata, const char *workernam
     ignore = username;
     strsep(&ignore, "._");
 
-    /* Find the user first */
-    user = get_user(sdata, username);
+    /* Find the user first (normalize away any cashaddr prefix to match the
+     * account key created in generate_user) */
+    user = get_user(sdata, strip_cashaddr_prefix(username));
     return user;
 }
 
@@ -6795,6 +6829,11 @@ static user_instance_t *generate_user(pool_t *ckp, stratum_instance_t *client,
     username = strsep(&base_username, "._");
     if (!username || !strlen(username))
         username = base_username;
+    /* Normalize away a cashaddr prefix so "bitcoincash:qq.." and "qq.." are one
+     * account. Only the account key is normalized; client->workername and the
+     * worker instance keep the original spelling so share submissions (which
+     * echo the full username) still match. */
+    username = (char *)strip_cashaddr_prefix(username);
     len = strlen(username);
     if (unlikely(len > MAX_USERNAME))
         username[MAX_USERNAME] = 0;
@@ -6881,23 +6920,6 @@ static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t cli
     stratum_add_send(sdata, json_msg, client_id, SM_UPDATE);
 }
 
-/* Strip a cashaddr network prefix from a stratum username so that
- * "bitcoincash:qq..." and "qq..." map to the same pool account (the prefix
- * carries no information - the node validates both spellings identically). */
-static const char *strip_cashaddr_prefix(const char *buf)
-{
-    static const char *prefixes[] = {"bitcoincash:", "bchtest:", "bchreg:"};
-
-    for (size_t i = 0; i < sizeof(prefixes)/sizeof(*prefixes); i++) {
-        const size_t plen = strlen(prefixes[i]);
-
-        if (!strncasecmp(buf, prefixes[i], plen) &&
-            buf[plen] && buf[plen] != '.' && buf[plen] != '_')
-            return buf + plen;
-    }
-    return buf;
-}
-
 /* Needs to be entered with client holding a ref count. */
 static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_val, json_t **err_val)
 {
@@ -6944,8 +6966,6 @@ static json_t *parse_authorize(stratum_instance_t *client, const json_t *params_
         *err_val = json_string("Invalid character in username");
         goto out;
     }
-    /* Normalize away a cashaddr prefix so both spellings are one account */
-    buf = strip_cashaddr_prefix(buf);
     pass = json_string_value(json_array_get(params_val, 1));
     user = generate_user(ckp, client, buf);
     client->user_id = user->id;
