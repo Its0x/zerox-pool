@@ -1330,6 +1330,7 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
 static void stratum_broadcast_update(sdata_t *sdata, const workbase_t *wb, bool clean);
 static void stratum_broadcast_solo_updates(sdata_t *sdata, bool clean);
+static void reset_round_bestshare(sdata_t *sdata);
 
 static void clear_userwb(sdata_t *sdata, const int64_t id)
 {
@@ -2381,6 +2382,10 @@ retry:
         char lastswaphash[LastSwapHashSz];
         get_lastswaphash_threadsafe(sdata, lastswaphash);
         LOGNOTICE("Block hash changed to %s", lastswaphash);
+        /* Chain advanced to a new block: a share is only valid for the block
+         * it was found on, so reset the best-share display stat. Does NOT
+         * touch share accounting or payout weighting. */
+        reset_round_bestshare(sdata);
         /* Checking existence of DL list lockless but not trying to
          * reference data */
         if (sdata->stats.unconfirmed)
@@ -4629,6 +4634,37 @@ static void reset_bestshares(sdata_t *sdata)
 
     mutex_lock(&sdata->stats_lock);
     sdata->stats.best_diff = sdata->stats.accounted_diff_shares = sdata->stats.accounted_rejects = 0;
+    mutex_unlock(&sdata->stats_lock);
+
+    ck_wlock(&sdata->instance_lock);
+    HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
+        client->best_diff = 0;
+    }
+    HASH_ITER(hh, sdata->user_instances, user, tmpuser) {
+        worker_instance_t *worker;
+
+        user->best_diff = 0;
+        DL_FOREACH(user->worker_instances, worker) {
+            worker->best_diff = 0;
+        }
+    }
+    ck_wunlock(&sdata->instance_lock);
+}
+
+/* Reset ONLY the best-share display stats when the chain advances to a new
+ * block (any miner on the network, not just us). A share is only valid for the
+ * block it was found on, so "best share this round" should reflect the block
+ * currently being mined. Unlike reset_bestshares(), this deliberately leaves
+ * accounted_diff_shares / accounted_rejects and all payout weighting (herp)
+ * untouched — those track the payout round and only reset when WE find a block.
+ * best_diff_alltime is never reset here either. */
+static void reset_round_bestshare(sdata_t *sdata)
+{
+    stratum_instance_t *client, *tmp;
+    user_instance_t *user, *tmpuser;
+
+    mutex_lock(&sdata->stats_lock);
+    sdata->stats.best_diff = 0;
     mutex_unlock(&sdata->stats_lock);
 
     ck_wlock(&sdata->instance_lock);
