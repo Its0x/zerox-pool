@@ -55,9 +55,18 @@ static const double nonces = 4294967296;
 #define CBGENLEN	34 /* Maximum extra space required per user in coinbase */
 #define DERP_DUST	5460 /* Minimum DERP to get onto payout list */
 #define PAYOUT_DUST	DUST_LIMIT_SATS /* Minimum payout not dust -- currently 546 sats */
+#define PAYOUT_EXPIRY_SECS (180 * 24 * 60 * 60) /* Sub-dust carry-forward from a miner
+                                    * that has submitted no shares for this long is
+                                    * expired: its accumulated herp is dropped so it
+                                    * stops diluting active miners' payout share. */
 #define DERP_SPACE	1000 /* Minimum derp to warrant leaving coinbase space */
-#define PAYOUT_USERS    100 /* Number of top users that get reward each block */
-#define PAYOUT_REWARDS  150 /* Max number of users rewarded each block */
+#define PAYOUT_USERS    1900 /* Number of top users that get reward each block */
+#define PAYOUT_REWARDS  2000 /* Max number of users rewarded each block. Sized far
+                              * above any realistic miner count so the 546-sat dust
+                              * limit (not this cap) decides who is paid on-chain;
+                              * everyone below dust carries forward. Bounded by the
+                              * 1MB coinbase (MAX_CB_SPACE/CBGENLEN ~= 29k) and by the
+                              * stack paygens[] arrays. */
 #define SATOSHIS	100000000 /* Satoshi to a BTC */
 #if PAYOUT_REWARDS * CBGENLEN > MAX_CB_SPACE
 #error Please set PAYOUT_REWARDS to fit inside a coinbase tx (MAX_CB_SPACE)!
@@ -9547,8 +9556,10 @@ static void calc_user_paygens(sdata_t *sdata)
     double total_herp = 0;
     user_instance_t *user, *tmpuser;
     int payouts = 0;
+    tv_t now;
 
     memset(paygens, 0, sizeof(paygens));
+    tv_time(&now);
 
     /* This function is serialised with respect to all modifications
      * of rolling_herp so no locking is needed. */
@@ -9557,6 +9568,19 @@ static void calc_user_paygens(sdata_t *sdata)
     HASH_ITER(hh, sdata->user_instances, user, tmpuser) {
         if (!user->bchaddress)
             continue;
+        /* Expire sub-dust carry-forward from a miner that has done no work
+         * (herp < 1) and submitted no shares for PAYOUT_EXPIRY_SECS. Zeroing
+         * its accumulated herp drops it from the payout denominator, so the
+         * value it could never claim returns to active miners. Lockless zero
+         * is fine here, matching confirm_block. */
+        if (user->accumulated > 0 && user->herp < 1 &&
+            now.tv_sec - user->last_share.tv_sec > PAYOUT_EXPIRY_SECS) {
+            LOGINFO("Expiring %f accumulated herp from user %s idle since %ld",
+                    user->accumulated, user->username, (long)user->last_share.tv_sec);
+            user->accumulated = 0;
+            user->postponed = 0;
+            continue;
+        }
         if (user->herp + user->accumulated < 1)
             continue;
         gen = ckzalloc(sizeof(generation_t));
